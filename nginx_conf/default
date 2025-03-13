@@ -1,0 +1,21 @@
+server {
+    listen 80;
+    server_name localhost;
+
+    location / {
+        root /usr/share/nginx/html;
+        index index.html;
+    }
+
+    location /dash_content/ {
+        add_header Access-Control-Allow-Origin *;
+        add_header Access-Control-Allow-Methods 'GET, OPTIONS';
+        add_header Access-Control-Allow-Headers 'Range';
+        types {
+            application/dash+xml mpd;
+            video/mp4 mp4;
+            video/webm webm;
+        }
+        root /usr/share/nginx/html;
+    }
+}

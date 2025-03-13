@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deep-learning
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deep-learning
+  template:
+    metadata:
+      labels:
+        app: deep-learning
+    spec:
+      containers:
+      - name: pytorch
+        image: pytorch/pytorch:latest
+        ports:
+        - containerPort: 5000
+        resources:
+          limits:
+            nvidia.com/gpu: 1  # 让 Kubernetes 自动分配 GPU
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      volumes:
+      - name: workspace
+        hostPath:
+          path: /home/easyai/Dash客户端/DRL_ABR_Project/dl_workspace

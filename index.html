@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.dashjs.org/v3.2.2/dash.all.min.js"></script>
+</head>
+<body>
+    <video id="videoPlayer" controls></video>
+    <button id="playButton">点击播放视频</button>
+    <script>
+        var url = "http://127.0.0.1:8080/dash_content/manifest.mpd";
+        var player = dashjs.MediaPlayer().create();
+        player.initialize(document.querySelector("#videoPlayer"), url, true);
+        
+        // **关闭 DASH.js 默认的 ABR 规则**
+        player.updateSettings({
+            streaming: {
+                abr: {
+                    useDefaultABRRules: false
+                }
+            }
+        });
+
+        // 全局变量存储码率切换次数
+        if (typeof window.switchCount === 'undefined') {
+            window.switchCount = 0;
+            player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, function() {
+                window.switchCount++;
+            });
+        }
+
+        // 请求 DRL服务器获取推荐码率
+        async function getDrlBitrate() {
+            try {
+                let dashMetrics = player.getDashMetrics();
+                let qualityIndex = player.getQualityFor("video");  // 获取当前播放的质量级别（索引）
+                let bitrateInfo = player.getBitrateInfoListFor("video");
+
+                let currentBitrate = bitrateInfo && bitrateInfo[qualityIndex] ? bitrateInfo[qualityIndex].bitrate : 0;
+                let bufferLevel = dashMetrics ? dashMetrics.getCurrentBufferLevel("video") || 0 : 0;
+                let httpRequests = dashMetrics.getHttpRequests("video");
+                let latestRequest = httpRequests.length ? httpRequests[httpRequests.length - 1] : null;
+                let throughput = latestRequest && latestRequest._throughput ? latestRequest._throughput : 0;
+
+                let latestRequest1 = dashMetrics.getHttpRequests("video").slice(-1)[0];
+                let latency = latestRequest1 ? latestRequest1.latency : 0;
+                let switchCount = window.switchCount;
+
+                let data = {
+                    timestamp: new Date().toISOString(),
+                    bitrate: currentBitrate,  // 码率 (bps)
+                    buffer: bufferLevel,      // 缓冲区大小 (秒)
+                    throughput: throughput,   // 网络带宽估计 (bps)
+                    latency: latency,         // 网络延迟 (秒)
+                    switch_count: switchCount // 码率切换次数
+                };
+
+                console.log("🚀 发送到 DRL 服务器的数据:", data);
+
+                let response = await fetch('http://127.0.0.1:5000/predict_bitrate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+
+                let result = await response.json();
+                console.log("🚀 DRL 服务器返回的结果:", result.bitrate);
+
+                return result.bitrate;
+            } catch (error) {
+                console.error("🚨 获取 DRL 推荐码率失败:", error);
+                return null;
+            }
+
+        }
+
+        // 加载新的视频片段前调用 DRL 模型
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_PROGRESS, async function () {
+            let drlBitrate = await getDrlBitrate();
+            if (drlBitrate) {
+                let bitrateList = player.getBitrateInfoListFor("video");
+                let qualityIndex = bitrateList.findIndex(b => b.bitrate === drlBitrate);
+
+                if (qualityIndex !== -1) {
+                    console.log(`🎯 设置码率: ${drlBitrate} (质量索引: ${qualityIndex})`);
+                    player.setQualityFor("video", qualityIndex);
+                } else {
+                    console.warn("⚠️ DRL 选择的码率未找到匹配索引，跳过设置");
+                }
+            }
+        });
+
+        // 记录日志的函数
+        function logMetrics() {
+            try {
+                let dashMetrics = player.getDashMetrics();
+                let qualityIndex = player.getQualityFor("video");  // 获取当前播放的质量级别（索引）
+                let bitrateInfo = player.getBitrateInfoListFor("video");
+
+                let currentBitrate = bitrateInfo && bitrateInfo[qualityIndex] ? bitrateInfo[qualityIndex].bitrate : 0;
+                let bufferLevel = dashMetrics ? dashMetrics.getCurrentBufferLevel("video") || 0 : 0;
+                let httpRequests = dashMetrics.getHttpRequests("video");
+                let latestRequest = httpRequests.length ? httpRequests[httpRequests.length - 1] : null;
+                let throughput = latestRequest && latestRequest._throughput ? latestRequest._throughput : 0;
+
+                let latestRequest1 = dashMetrics.getHttpRequests("video").slice(-1)[0];
+                let latency = latestRequest1 ? latestRequest1.latency : 0;
+                let switchCount = window.switchCount;
+
+                let logEntry = {
+                    timestamp: new Date().toISOString(),
+                    bitrate: currentBitrate,  // 码率 (bps)
+                    buffer: bufferLevel,      // 缓冲区大小 (秒)
+                    throughput: throughput,   // 网络带宽估计 (bps)
+                    latency: latency,         // 网络延迟 (秒)
+                    switch_count: switchCount // 码率切换次数
+                };
+
+                console.log("Log Entry:", logEntry);
+
+                // 发送日志到 Flask 服务器
+                fetch('http://127.0.0.1:5000/log', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(logEntry)
+                })
+                .then(response => response.json())
+                .then(data => console.log('日志发送成功:', data))
+                .catch(error => console.error("日志发送失败:", error));
+
+            } catch (error) {
+                console.error("⚠️ logMetrics 执行出错:", error);
+            }
+        }
+
+        // 每 1 秒记录一次日志
+        setInterval(logMetrics, 1000);
+
+
+        // 添加事件监听器来跟踪码率切换次数
+        if (!window.switchCount) {
+            window.switchCount = 0;
+            player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, function() {
+                window.switchCount++;
+            });
+        }
+
+
+        // 监听音轨加载并切换到第一个音轨
+        player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, function () {
+            let audioTracks = player.getTracksFor("audio");
+            if (audioTracks.length > 0) {
+                console.log("切换到音频轨道：" + audioTracks[0].id);
+                player.setCurrentTrack(audioTracks[0]);
+            }
+        });
+
+        document.getElementById("playButton").addEventListener("click", function() {
+            var video = document.querySelector("#videoPlayer");
+            video.play().then(() => {
+                console.log("视频播放成功");
+            }).catch(error => {
+                console.error("播放失败:", error);
+            });
+        });
+
+    </script>
+</body>
+</html>

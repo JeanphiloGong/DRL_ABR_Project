@@ -1,0 +1,225 @@
+### **🚀 部署 DRL 模型到 DASH 客户端**
+你的目标是 **让 DASH.js 使用 DRL 选择最佳码率，而不是默认的 Adaptive Bitrate (ABR) 规则**。  
+在这一步，你需要：
+1. **加载训练好的 DRL 模型**
+2. **用 DRL 预测码率**
+3. **在 DASH.js 里替换默认的 ABR 策略**
+4. **继续监控带宽、缓冲状态，记录日志，优化模型**
+
+---
+
+## **✅ 1. 在 Flask 服务器加载 DRL 模型**
+DASH.js 需要通过 API **请求 DRL 预测码率**，所以你需要一个 **Flask 端点** 来处理请求。
+
+### **📌 1.1 加载 DRL 模型**
+修改 `server.py`，在 Flask 服务器中添加 **模型加载 & 预测 API**：
+```python
+import torch
+import torch.nn as nn
+import sqlite3
+import numpy as np
+from flask import Flask, request, jsonify
+
+# 初始化 Flask
+app = Flask(__name__)
+
+# 加载训练好的 Q-Network
+class QNetwork(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(QNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_size, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, action_size)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+# 码率选项（单位：kbps）
+bitrate_options = [500, 1000, 2500, 5000, 8000]
+
+# 加载模型
+STATE_SIZE = 5  # (bitrate, buffer, throughput, latency, switch_count)
+ACTION_SIZE = len(bitrate_options)
+q_network = QNetwork(STATE_SIZE, ACTION_SIZE)
+q_network.load_state_dict(torch.load("abr_q_network.pth"))
+q_network.eval()
+
+# 预处理输入数据
+def normalize(x, min_val, max_val):
+    return (x - min_val) / (max_val - min_val)
+
+@app.route('/predict_bitrate', methods=['POST'])
+def predict_bitrate():
+    try:
+        data = request.json
+        state = np.array([
+            data["bitrate"],
+            data["buffer"],
+            data["throughput"],
+            data["latency"],
+            data["switch_count"]
+        ], dtype=np.float32)
+
+        # 归一化数据
+        state[1] = normalize(state[1], 0, 10)  # 假设 buffer 最大值为 10 秒
+        state[2] = normalize(state[2], 0, 10000)  # 假设带宽最大值 10 Mbps
+        state[3] = normalize(state[3], 0, 5)  # 假设时延最大值 5s
+        state[4] = normalize(state[4], 0, 10)  # 码率切换最大值 10
+
+        # 转换为 Tensor
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+
+        # 预测码率
+        with torch.no_grad():
+            action_idx = torch.argmax(q_network(state_tensor)).item()
+
+        selected_bitrate = bitrate_options[action_idx]
+        return jsonify({"bitrate": selected_bitrate})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+### **📌 1.2 启动 Flask 服务器**
+```bash
+python server.py
+```
+---
+
+## **✅ 2. 修改 DASH.js，让它使用 DRL 预测码率**
+DASH.js **默认使用 BOLA/MPC 规则**，现在要 **替换为 DRL 预测的码率**。
+
+### **📌 2.1 修改 `index.html`**
+在 DASH.js **请求下一个分片时，调用 Flask 服务器** 获取 DRL 预测的码率。
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+</head>
+<body>
+    <video id="videoPlayer" controls></video>
+    <script>
+        var url = "http://127.0.0.1:8080/dash_content/manifest.mpd";
+        var player = dashjs.MediaPlayer().create();
+        player.initialize(document.querySelector("#videoPlayer"), url, true);
+
+        // 记录日志的函数
+        async function getDrlBitrate() {
+            try {
+                let dashMetrics = player.getDashMetrics();
+                let qualityIndex = player.getQualityFor("video");
+                let bitrateInfo = player.getBitrateInfoListFor("video");
+
+                let currentBitrate = bitrateInfo[qualityIndex] ? bitrateInfo[qualityIndex].bitrate : 0;
+                let bufferLevel = dashMetrics.getCurrentBufferLevel("video") || 0;
+                let throughput = dashMetrics.getCurrentThroughput("video") || 0;
+                let latency = dashMetrics.getCurrentLatency("video") || 0;
+                let switchCount = dashMetrics.getSwitchRequests("video")?.length || 0;
+
+                let data = {
+                    bitrate: currentBitrate,
+                    buffer: bufferLevel,
+                    throughput: throughput,
+                    latency: latency,
+                    switch_count: switchCount
+                };
+
+                // 发送请求到 DRL 服务器
+                let response = await fetch("http://127.0.0.1:5000/predict_bitrate", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(data)
+                });
+
+                let result = await response.json();
+                console.log("DRL 选择的码率:", result.bitrate);
+                return result.bitrate;
+
+            } catch (error) {
+                console.error("DRL 码率预测失败:", error);
+                return null;
+            }
+        }
+
+        // 替换 DASH 默认的 ABR 逻辑
+        player.updateSettings({
+            streaming: {
+                abr: {
+                    useDefaultABRRules: false // 关闭默认的 ABR 规则
+                }
+            }
+        });
+
+        // 监听下一段视频加载前，调整码率
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_PROGRESS, async function () {
+            let drlBitrate = await getDrlBitrate();
+            if (drlBitrate) {
+                let bitrateList = player.getBitrateInfoListFor("video");
+                let qualityIndex = bitrateList.findIndex(b => b.bitrate === drlBitrate);
+
+                if (qualityIndex !== -1) {
+                    console.log(`设置码率: ${drlBitrate} (质量索引: ${qualityIndex})`);
+                    player.setQualityFor("video", qualityIndex);
+                }
+            }
+        });
+
+    </script>
+</body>
+</html>
+```
+
+---
+
+## **✅ 3. 监控 & 记录 DRL 码率切换情况**
+在 `server.py` 里 **增加日志存储**，用于 **后续优化 DRL 模型**。
+
+```python
+@app.route('/log_drl', methods=['POST'])
+def log_drl():
+    try:
+        data = request.json
+        with open("drl_predictions.json", "a") as f:
+            json.dump(data, f)
+            f.write("\n")
+        return jsonify({"status": "logged"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+```
+
+在 `DASH.js` 里调用这个日志 API：
+```js
+async function logDrlDecision(bitrate) {
+    fetch("http://127.0.0.1:5000/log_drl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bitrate: bitrate, timestamp: new Date().toISOString() })
+    });
+}
+```
+
+---
+
+## **🚀 最终实现**
+✅ **Flask API 让 DASH.js 调用 DRL 预测码率**  
+✅ **DASH.js 替换默认 ABR 逻辑，使用 DRL 预测码率**  
+✅ **监控码率切换，记录日志，优化 DRL 训练**  
+
+---
+
+## **🚀 你可以这样测试**
+1. **启动 Flask 服务器**
+   ```bash
+   python server.py
+   ```
+2. **在浏览器打开 `index.html`**
+3. **查看 `F12 > Console`，检查是否使用 DRL 预测的码率**
+4. **查看 `F12 > Network`，是否按 DRL 选择的码率加载视频**
+5. **检查 `drl_predictions.json`，看 DRL 选择了哪些码率**
